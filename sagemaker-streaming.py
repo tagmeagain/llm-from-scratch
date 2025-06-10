@@ -1,10 +1,43 @@
 import boto3
 import json
 import time
+import io
 from typing import Generator, Dict, Any, List
 from dataclasses import dataclass
 from datetime import datetime
 import pandas as pd
+
+class LineIterator:
+    """
+    A helper class for parsing the byte stream input.
+    Handles cases where JSON objects may be split across PayloadPart events.
+    """
+    def __init__(self, stream):
+        self.byte_iterator = iter(stream)
+        self.buffer = io.BytesIO()
+        self.read_pos = 0
+
+    def __iter__(self):
+        return self
+
+    def __next__(self):
+        while True:
+            self.buffer.seek(self.read_pos)
+            line = self.buffer.readline()
+            if line and line[-1] == ord("\n"):
+                self.read_pos += len(line)
+                return line[:-1]
+            try:
+                chunk = next(self.byte_iterator)
+            except StopIteration:
+                if self.read_pos < self.buffer.getbuffer().nbytes:
+                    continue
+                raise
+            if "PayloadPart" not in chunk:
+                print("Unknown event type:" + chunk)
+                continue
+            self.buffer.seek(0, io.SEEK_END)
+            self.buffer.write(chunk["PayloadPart"]["Bytes"])
 
 @dataclass
 class ResponseMetrics:
@@ -64,31 +97,40 @@ class StreamingSageMakerClient:
         total_tokens = 0
         prompt_tokens = self.count_tokens(prompt)
         
+        # Create request body
+        body = {
+            "inputs": prompt,
+            "parameters": {
+                "max_new_tokens": max_tokens,
+                "temperature": temperature
+            },
+            "stream": True
+        }
+        
+        # Invoke endpoint with streaming
         response = self.runtime.invoke_endpoint_with_response_stream(
             EndpointName=self.endpoint_name,
             ContentType='application/json',
-            Body=json.dumps({
-                'prompt': prompt,
-                'max_tokens': max_tokens,
-                'temperature': temperature
-            })
+            Body=json.dumps(body)
         )
         
-        # Process the streaming response
-        for event in response['EventStream']:
-            if 'PayloadPart' in event:
+        # Process the streaming response using LineIterator
+        event_stream = response["Body"]
+        start_json = b"{"
+        stop_token = "\n"
+        
+        for line in LineIterator(event_stream):
+            if line != b"" and start_json in line:
                 try:
-                    chunk = event['PayloadPart']['Bytes'].decode('utf-8')
-                    if chunk.startswith('data: '):
-                        data = json.loads(chunk[6:])  # Remove 'data: ' prefix
-                        if 'text' in data:
-                            if first_token_time is None:
-                                first_token_time = time.time()
-                            text = data['text']
-                            total_tokens += self.count_tokens(text)
-                            yield text
-                except (json.JSONDecodeError, UnicodeDecodeError) as e:
-                    print(f"Error processing chunk: {e}")
+                    data = json.loads(line[line.find(start_json):].decode("utf-8"))
+                    if "token" in data and data["token"]["text"] != stop_token:
+                        if first_token_time is None:
+                            first_token_time = time.time()
+                        text = data["token"]["text"]
+                        total_tokens += self.count_tokens(text)
+                        yield text
+                except json.JSONDecodeError as e:
+                    print(f"Error decoding JSON: {e}")
                     continue
         
         end_time = time.time()
@@ -110,14 +152,19 @@ class StreamingSageMakerClient:
         """
         Get the complete response at once (non-streaming)
         """
+        body = {
+            "inputs": prompt,
+            "parameters": {
+                "max_new_tokens": max_tokens,
+                "temperature": temperature
+            },
+            "stream": False
+        }
+        
         response = self.runtime.invoke_endpoint(
             EndpointName=self.endpoint_name,
             ContentType='application/json',
-            Body=json.dumps({
-                'prompt': prompt,
-                'max_tokens': max_tokens,
-                'temperature': temperature
-            })
+            Body=json.dumps(body)
         )
         
         return response['Body'].read().decode('utf-8')
